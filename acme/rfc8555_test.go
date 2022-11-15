@@ -15,12 +15,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -146,7 +148,7 @@ func TestRFC_postKID(t *testing.T) {
 			w.Header().Set("Location", "/account-1")
 			w.Write([]byte(`{"status":"valid"}`))
 		case "/post":
-			b, _ := ioutil.ReadAll(r.Body) // check err later in decodeJWSxxx
+			b, _ := io.ReadAll(r.Body) // check err later in decodeJWSxxx
 			head, err := decodeJWSHead(bytes.NewReader(b))
 			if err != nil {
 				t.Errorf("decodeJWSHead: %v", err)
@@ -192,13 +194,13 @@ func TestRFC_postKID(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	b, _ := ioutil.ReadAll(res.Body) // don't care about err - just checking b
+	b, _ := io.ReadAll(res.Body) // don't care about err - just checking b
 	if string(b) != "pong" {
 		t.Errorf("res.Body = %q; want pong", b)
 	}
 }
 
-// acmeServer simulates a subset of RFC8555 compliant CA.
+// acmeServer simulates a subset of RFC 8555 compliant CA.
 //
 // TODO: We also have x/crypto/acme/autocert/acmetest and startACMEServerStub in autocert_test.go.
 // It feels like this acmeServer is a sweet spot between usefulness and added complexity.
@@ -232,6 +234,7 @@ func (s *acmeServer) start() {
 				"newOrder": %q,
 				"newAuthz": %q,
 				"revokeCert": %q,
+				"keyChange": %q,
 				"meta": {"termsOfService": %q}
 				}`,
 				s.url("/acme/new-nonce"),
@@ -239,6 +242,7 @@ func (s *acmeServer) start() {
 				s.url("/acme/new-order"),
 				s.url("/acme/new-authz"),
 				s.url("/acme/revoke-cert"),
+				s.url("/acme/key-change"),
 				s.url("/terms"),
 			)
 			return
@@ -293,7 +297,7 @@ func TestRFC_Register(t *testing.T) {
 			"orders": %q
 		}`, email, s.url("/accounts/1/orders"))
 
-		b, _ := ioutil.ReadAll(r.Body) // check err later in decodeJWSxxx
+		b, _ := io.ReadAll(r.Body) // check err later in decodeJWSxxx
 		head, err := decodeJWSHead(bytes.NewReader(b))
 		if err != nil {
 			t.Errorf("decodeJWSHead: %v", err)
@@ -524,7 +528,7 @@ func TestRFC_UpdateReg(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status": "valid"}`))
 
-		b, _ := ioutil.ReadAll(r.Body) // check err later in decodeJWSxxx
+		b, _ := io.ReadAll(r.Body) // check err later in decodeJWSxxx
 		head, err := decodeJWSHead(bytes.NewReader(b))
 		if err != nil {
 			t.Errorf("decodeJWSHead: %v", err)
@@ -618,6 +622,128 @@ func TestRFC_GetRegOtherError(t *testing.T) {
 	cl := &Client{Key: testKeyEC, DirectoryURL: s.url("/")}
 	if _, err := cl.GetReg(context.Background(), ""); err == nil || err == ErrNoAccount {
 		t.Errorf("GetReg: %v; want any other non-nil err", err)
+	}
+}
+
+func TestRFC_AccountKeyRollover(t *testing.T) {
+	s := newACMEServer()
+	s.handle("/acme/new-account", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", s.url("/accounts/1"))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status": "valid"}`))
+	})
+	s.handle("/acme/key-change", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	s.start()
+	defer s.close()
+
+	cl := &Client{Key: testKeyEC, DirectoryURL: s.url("/")}
+	if err := cl.AccountKeyRollover(context.Background(), testKeyEC384); err != nil {
+		t.Errorf("AccountKeyRollover: %v, wanted no error", err)
+	} else if cl.Key != testKeyEC384 {
+		t.Error("AccountKeyRollover did not rotate the client key")
+	}
+}
+
+func TestRFC_DeactivateReg(t *testing.T) {
+	const email = "mailto:user@example.org"
+	curStatus := StatusValid
+
+	type account struct {
+		Status    string   `json:"status"`
+		Contact   []string `json:"contact"`
+		AcceptTOS bool     `json:"termsOfServiceAgreed"`
+		Orders    string   `json:"orders"`
+	}
+
+	s := newACMEServer()
+	s.handle("/acme/new-account", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", s.url("/accounts/1"))
+		w.WriteHeader(http.StatusOK) // 200 means existing account
+		json.NewEncoder(w).Encode(account{
+			Status:    curStatus,
+			Contact:   []string{email},
+			AcceptTOS: true,
+			Orders:    s.url("/accounts/1/orders"),
+		})
+
+		b, _ := io.ReadAll(r.Body) // check err later in decodeJWSxxx
+		head, err := decodeJWSHead(bytes.NewReader(b))
+		if err != nil {
+			t.Errorf("decodeJWSHead: %v", err)
+			return
+		}
+		if len(head.JWK) == 0 {
+			t.Error("head.JWK is empty")
+		}
+
+		var req struct {
+			Status       string   `json:"status"`
+			Contact      []string `json:"contact"`
+			AcceptTOS    bool     `json:"termsOfServiceAgreed"`
+			OnlyExisting bool     `json:"onlyReturnExisting"`
+		}
+		decodeJWSRequest(t, &req, bytes.NewReader(b))
+		if !req.OnlyExisting {
+			t.Errorf("req.OnlyReturnExisting = %t; want = %t", req.OnlyExisting, true)
+		}
+	})
+	s.handle("/accounts/1", func(w http.ResponseWriter, r *http.Request) {
+		if curStatus == StatusValid {
+			curStatus = StatusDeactivated
+			w.WriteHeader(http.StatusOK)
+		} else {
+			s.error(w, &wireError{
+				Status: http.StatusUnauthorized,
+				Type:   "urn:ietf:params:acme:error:unauthorized",
+			})
+		}
+		var req account
+		b, _ := io.ReadAll(r.Body) // check err later in decodeJWSxxx
+		head, err := decodeJWSHead(bytes.NewReader(b))
+		if err != nil {
+			t.Errorf("decodeJWSHead: %v", err)
+			return
+		}
+		if len(head.JWK) != 0 {
+			t.Error("head.JWK is not empty")
+		}
+		if !strings.HasSuffix(head.KID, "/accounts/1") {
+			t.Errorf("head.KID = %q; want suffix /accounts/1", head.KID)
+		}
+
+		decodeJWSRequest(t, &req, bytes.NewReader(b))
+		if req.Status != StatusDeactivated {
+			t.Errorf("req.Status = %q; want = %q", req.Status, StatusDeactivated)
+		}
+	})
+	s.start()
+	defer s.close()
+
+	cl := &Client{Key: testKeyEC, DirectoryURL: s.url("/")}
+	if err := cl.DeactivateReg(context.Background()); err != nil {
+		t.Errorf("DeactivateReg: %v, wanted no error", err)
+	}
+	if err := cl.DeactivateReg(context.Background()); err == nil {
+		t.Errorf("DeactivateReg: %v, wanted error for unauthorized", err)
+	}
+}
+
+func TestRF_DeactivateRegNoAccount(t *testing.T) {
+	s := newACMEServer()
+	s.handle("/acme/new-account", func(w http.ResponseWriter, r *http.Request) {
+		s.error(w, &wireError{
+			Status: http.StatusBadRequest,
+			Type:   "urn:ietf:params:acme:error:accountDoesNotExist",
+		})
+	})
+	s.start()
+	defer s.close()
+
+	cl := &Client{Key: testKeyEC, DirectoryURL: s.url("/")}
+	if err := cl.DeactivateReg(context.Background()); !errors.Is(err, ErrNoAccount) {
+		t.Errorf("DeactivateReg: %v, wanted ErrNoAccount", err)
 	}
 }
 
