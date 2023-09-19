@@ -559,7 +559,7 @@ userAuthLoop:
 					return nil, parseError(msgUserAuthRequest)
 				}
 
-				if candidate.result == nil {
+				if candidate.result == nil || errors.Is(candidate.result, ErrPartialSuccess) {
 					okMsg := userAuthPubKeyOkMsg{
 						Algo:   algo,
 						PubKey: pubKeyData,
@@ -713,7 +713,7 @@ userAuthLoop:
 		}
 
 		// if auth error is partial success, so need next auth
-		if authErr == ErrPartialSuccess {
+		if errors.Is(authErr, ErrPartialSuccess) {
 			if len(nextAuthMethods) > 0 {
 				nextAuthLoaded = true
 				failureMsg.PartialSuccess = true
